@@ -98,7 +98,6 @@ def game_logging_configurer(queue, level):
         root.addHandler(h)
         root.setLevel(level)
 
-
 def start(li, user_profile, engine_factory, config, logging_level, log_filename):
     challenge_config = config["challenge"]
     max_games = challenge_config.get("concurrency", 1)
@@ -129,6 +128,8 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename)
             except InterruptedError:
                 continue
 
+            print(event)
+
             if event.get("type") is None:
                 logger.warning("Unable to handle response from lichess.org:")
                 logger.warning(event)
@@ -141,7 +142,7 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename)
             elif event["type"] == "local_game_done":
                 busy_processes -= 1
                 logger.info("+++ Process Free. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
-            elif event["type"] == "challenge":
+            elif event["type"] == "challenge" and not event['challenge']['challenger']['id'] == 'gobychess-dev':
                 chlng = model.Challenge(event["challenge"])
                 if chlng.is_supported(challenge_config):
                     challenge_queue.append(chlng)
@@ -176,6 +177,9 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename)
                 logger.info("--- Process Used. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
                 game_id = event["game"]["id"]
                 pool.apply_async(play_game, [li, game_id, control_queue, engine_factory, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level])
+            elif event["type"] == "challengeDeclined":
+                queued_processes -= 1
+
 
             if (event["type"] == "correspondence_ping" or (event["type"] == "local_game_done" and not wait_for_correspondence_ping)) and not challenge_queue:
                 if event["type"] == "correspondence_ping" and wait_for_correspondence_ping:
@@ -193,17 +197,30 @@ def start(li, user_profile, engine_factory, config, logging_level, log_filename)
                         logger.info("--- Process Used. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
                         pool.apply_async(play_game, [li, game_id, control_queue, engine_factory, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level])
 
-            while ((queued_processes + busy_processes) < max_games and challenge_queue):  # keep processing the queue until empty or max_games is reached
-                chlng = challenge_queue.pop(0)
+            if challenge_queue:
+                while ((queued_processes + busy_processes) < max_games) and challenge_queue:  # keep processing the queue until empty or max_games is reached
+                    chlng = challenge_queue.pop(0)
+                    try:
+                        logger.info("Accept {}".format(chlng))
+                        queued_processes += 1
+                        li.accept_challenge(chlng.id)
+                        logger.info("--- Process Queue. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
+                    except (HTTPError, ReadTimeout) as exception:
+                        if isinstance(exception, HTTPError) and exception.response.status_code == 404:  # ignore missing challenge
+                            logger.info("Skip missing {}".format(chlng))
+                        queued_processes -= 1
+
+            elif ((queued_processes + busy_processes) < max_games):
+                #logger.info("Challenging {}".format("GobyChess"))
                 try:
-                    logger.info("Accept {}".format(chlng))
+                    logger.info("challenge")
                     queued_processes += 1
-                    li.accept_challenge(chlng.id)
-                    logger.info("--- Process Queue. Total Queued: {}. Total Used: {}".format(queued_processes, busy_processes))
+                    li.create_challenge("gobychess")
                 except (HTTPError, ReadTimeout) as exception:
                     if isinstance(exception, HTTPError) and exception.response.status_code == 404:  # ignore missing challenge
-                        logger.info("Skip missing {}".format(chlng))
+                        logger.info("Skip missing")
                     queued_processes -= 1
+                #time.sleep(5)
 
             control_queue.task_done()
 
@@ -333,14 +350,14 @@ def play_game(li, game_id, control_queue, engine_factory, user_profile, config, 
 
 def choose_move_time(engine, board, search_time, ponder, draw_offered):
     logger.info("Searching for time {}".format(search_time))
-    return engine.search_for(board, search_time, ponder, draw_offered)
+    return engine.search_for(board, search_time, ponder)
 
 
 def choose_first_move(engine, board, draw_offered):
     # need to hardcode first movetime (10000 ms) since Lichess has 30 sec limit.
     search_time = 10000
     logger.info("Searching for time {}".format(search_time))
-    return engine.first_search(board, search_time, draw_offered)
+    return engine.first_search(board, search_time)
 
 
 def get_book_move(board, polyglot_cfg):
@@ -562,7 +579,7 @@ def choose_move(engine, board, game, ponder, draw_offered, start_time, move_over
         btime = max(0, btime - move_overhead - pre_move_time)
 
     logger.info("Searching for wtime {} btime {}".format(wtime, btime))
-    return engine.search_with_ponder(board, wtime, btime, game.state["winc"], game.state["binc"], ponder, draw_offered)
+    return engine.search_with_ponder(board, wtime, btime, game.state["winc"], game.state["binc"], ponder)
 
 
 def check_for_draw_offer(game):
@@ -632,7 +649,7 @@ if __name__ == "__main__":
     enable_color_logging(debug_lvl=logging_level)
     logger.info(intro())
     CONFIG = load_config(args.config or "./config.yml")
-    li = lichess.Lichess(CONFIG["token"], CONFIG["url"], __version__)
+    li = lichess.Lichess(CONFIG["token"], CONFIG["url"], __version__, "bots.txt")
 
     user_profile = li.get_profile()
     username = user_profile["username"]
